@@ -30,6 +30,7 @@ import {
   ensureWebhookActionEnabled,
   hasWebhookAction,
 } from "@/utils/webhook-action";
+import { assertNoSenderOnlyOverlap } from "@/utils/rule/sender-scope-overlap";
 
 type CreateRuleEnablement =
   | { source: "default" }
@@ -144,7 +145,7 @@ async function updateRuleAndQueueHistory({
   return rule;
 }
 
-export function partialUpdateRule({
+export async function partialUpdateRule({
   ruleId,
   emailAccountId,
   data,
@@ -153,6 +154,21 @@ export function partialUpdateRule({
   emailAccountId: string;
   data: Partial<Rule>;
 }) {
+  if (hasRuleScopeUpdate(data)) {
+    const existingRule = await prisma.rule.findUnique({
+      where: { id: ruleId, emailAccountId },
+      select: RULE_SCOPE_SELECT,
+    });
+
+    if (!existingRule) throw new Error("Rule not found");
+
+    await assertNoSenderOnlyOverlap({
+      emailAccountId,
+      excludeRuleId: ruleId,
+      rule: mergeRuleScope(data, existingRule),
+    });
+  }
+
   return updateRuleAndQueueHistory({
     ruleId,
     emailAccountId,
@@ -216,12 +232,18 @@ export async function createRuleWithResolvedActions({
   emailAccountId,
   data,
   actions,
+  skipSenderOnlyOverlapCheck = false,
 }: {
   emailAccountId: string;
   data: RuleRecordData & { name: string };
   actions: RuleActionCreateData[];
+  skipSenderOnlyOverlapCheck?: boolean;
 }): Promise<RuleWithRelations> {
   assertWebhookActionsAllowed(actions);
+
+  if (!skipSenderOnlyOverlapCheck) {
+    await assertNoSenderOnlyOverlap({ emailAccountId, rule: data });
+  }
 
   validateLowTrustStaticFromOutboundActions({
     from: data.from,
@@ -271,17 +293,23 @@ export async function replaceRuleWithResolvedActions({
 }): Promise<RuleWithRelations> {
   assertWebhookActionsAllowed(actions);
 
+  const existingRule = await prisma.rule.findUnique({
+    where: { id: ruleId, emailAccountId },
+    select: RULE_SCOPE_SELECT,
+  });
+
+  await assertNoSenderOnlyOverlap({
+    emailAccountId,
+    excludeRuleId: ruleId,
+    rule: existingRule ? mergeRuleScope(data, existingRule) : data,
+  });
+
   validateLowTrustStaticFromOutboundActions({
     from: data.from,
     actionTypes: actions.map((action) => action.type),
   });
 
   validateWebhookUrlsInActions(actions);
-
-  const existingRule = await prisma.rule.findUnique({
-    where: { id: ruleId, emailAccountId },
-    select: { groupId: true },
-  });
 
   const rule = await prisma.rule.update({
     where: { id: ruleId, emailAccountId },
@@ -343,6 +371,16 @@ export async function createRule({
 
     assertWebhookActionsAllowed(result.actions);
 
+    await assertNoSenderOnlyOverlap({
+      emailAccountId,
+      rule: {
+        instructions: result.condition.aiInstructions,
+        from: result.condition.static?.from,
+        to: result.condition.static?.to,
+        subject: result.condition.static?.subject,
+      },
+    });
+
     validateLowTrustStaticFromOutboundActions({
       from: result.condition.static?.from,
       actionTypes: result.actions.map((action) => action.type),
@@ -380,6 +418,7 @@ export async function createRule({
         subject: result.condition.static?.subject,
       },
       actions: mappedActions,
+      skipSenderOnlyOverlapCheck: true,
     });
 
     queueRuleHistory({ rule, triggerType: "created" });
@@ -664,6 +703,50 @@ function shouldEnable(
     (action) => getActionRiskLevel(action, {}).level,
   );
   return riskLevels.every((level) => level === "low");
+}
+
+type RuleScopeKey =
+  | "instructions"
+  | "from"
+  | "to"
+  | "subject"
+  | "body"
+  | "groupId";
+
+const RULE_SCOPE_KEYS = [
+  "instructions",
+  "from",
+  "to",
+  "subject",
+  "body",
+  "groupId",
+] as const satisfies RuleScopeKey[];
+
+const RULE_SCOPE_SELECT = {
+  instructions: true,
+  from: true,
+  to: true,
+  subject: true,
+  body: true,
+  groupId: true,
+} as const;
+
+function hasRuleScopeUpdate(data: Partial<Rule>) {
+  return RULE_SCOPE_KEYS.some((key) => Object.hasOwn(data, key));
+}
+
+function mergeRuleScope<T extends Record<RuleScopeKey, string | null>>(
+  data: Partial<Rule>,
+  existingRule: T,
+): Record<RuleScopeKey, string | null> {
+  return Object.fromEntries(
+    RULE_SCOPE_KEYS.map((key) => [
+      key,
+      Object.hasOwn(data, key)
+        ? ((data[key] as string | null | undefined) ?? null)
+        : existingRule[key],
+    ]),
+  ) as Record<RuleScopeKey, string | null>;
 }
 
 function validateLowTrustStaticFromOutboundActions({

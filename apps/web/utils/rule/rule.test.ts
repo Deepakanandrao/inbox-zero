@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import prisma from "@/utils/__mocks__/prisma";
-import { ActionType } from "@/generated/prisma/enums";
+import { ActionType, GroupItemType } from "@/generated/prisma/enums";
 import { createEmailProvider } from "@/utils/email/provider";
 import { WEBHOOK_ACTION_DISABLED_MESSAGE } from "@/utils/webhook-action";
 import { getActionRiskLevel } from "@/utils/risk";
@@ -73,6 +73,7 @@ describe("deleteRule", () => {
       level: "low",
       message: "safe",
     });
+    prisma.rule.findMany.mockResolvedValue([]);
   });
 
   it("deletes the group first and relies on cascade delete for grouped rules", async () => {
@@ -135,6 +136,7 @@ describe("outbound action guardrails", () => {
       level: "low",
       message: "safe",
     });
+    prisma.rule.findMany.mockResolvedValue([]);
   });
 
   it("rejects creating a low-trust from rule with FORWARD", async () => {
@@ -177,6 +179,135 @@ describe("outbound action guardrails", () => {
 
     expect(prisma.rule.create).not.toHaveBeenCalled();
     expect(createEmailProvider).not.toHaveBeenCalled();
+  });
+
+  it("rejects creating a duplicate sender-only rule", async () => {
+    prisma.rule.findMany.mockResolvedValue([
+      {
+        name: "Existing sender rule",
+        instructions: null,
+        from: "sender@example.com",
+        to: null,
+        subject: null,
+        body: null,
+        group: {
+          items: [
+            {
+              value: "sender@example.com",
+              exclude: false,
+              type: GroupItemType.FROM,
+            },
+          ],
+        },
+      },
+    ] as any);
+    prisma.rule.create.mockResolvedValue({
+      id: "new-rule-id",
+      actions: [],
+      group: null,
+    } as any);
+
+    await expect(
+      createRule({
+        result: {
+          name: "Duplicate sender rule",
+          condition: {
+            aiInstructions: null,
+            conditionalOperator: null,
+            static: {
+              from: "sender@example.com",
+              to: null,
+              subject: null,
+            },
+          },
+          actions: [
+            {
+              type: ActionType.ARCHIVE,
+              fields: null,
+              delayInMinutes: null,
+            },
+          ],
+        },
+        emailAccountId: "email-account-id",
+        provider: "gmail",
+        runOnThreads: true,
+        logger,
+      }),
+    ).rejects.toThrow(
+      'Cannot create this rule because it overlaps the existing "Existing sender rule" rule',
+    );
+
+    expect(prisma.rule.create).not.toHaveBeenCalled();
+  });
+
+  it("allows sender-only rules when an overlapping existing rule is grouped", async () => {
+    const existingGroupedRule = {
+      name: "Existing grouped rule",
+      instructions: null,
+      from: "@example.com",
+      to: null,
+      subject: null,
+      body: null,
+      groupId: "group-id",
+      group: { items: [] },
+    };
+
+    prisma.rule.findMany.mockImplementation(async (args) => {
+      const select = (args as { select?: Record<string, unknown> }).select;
+
+      return [
+        {
+          name: existingGroupedRule.name,
+          instructions: existingGroupedRule.instructions,
+          from: existingGroupedRule.from,
+          to: existingGroupedRule.to,
+          subject: existingGroupedRule.subject,
+          body: existingGroupedRule.body,
+          groupId: select?.groupId ? existingGroupedRule.groupId : undefined,
+          group: existingGroupedRule.group,
+        },
+      ] as never;
+    });
+    prisma.rule.create.mockResolvedValue({
+      id: "new-rule-id",
+      actions: [],
+      group: null,
+    } as any);
+
+    await expect(
+      createRule({
+        result: {
+          name: "New sender rule",
+          condition: {
+            aiInstructions: null,
+            conditionalOperator: null,
+            static: {
+              from: "sender@example.com",
+              to: null,
+              subject: null,
+            },
+          },
+          actions: [
+            {
+              type: ActionType.ARCHIVE,
+              fields: null,
+              delayInMinutes: null,
+            },
+          ],
+        },
+        emailAccountId: "email-account-id",
+        provider: "gmail",
+        runOnThreads: true,
+        logger,
+      }),
+    ).resolves.toMatchObject({ id: "new-rule-id" });
+
+    expect(prisma.rule.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ groupId: true }),
+      }),
+    );
+    expect(prisma.rule.create).toHaveBeenCalled();
   });
 
   it("rejects updating a low-trust from rule before mapping action fields", async () => {
@@ -392,6 +523,14 @@ describe("outbound action guardrails", () => {
   });
 
   it("scopes partial rule updates to the email account", async () => {
+    prisma.rule.findUnique.mockResolvedValue({
+      instructions: "old instructions",
+      from: null,
+      to: null,
+      subject: null,
+      body: null,
+      groupId: null,
+    } as any);
     prisma.rule.update.mockResolvedValue({
       id: "rule-id",
       actions: [],
@@ -457,6 +596,7 @@ describe("replaceRuleWithResolvedActions", () => {
       level: "low",
       message: "safe",
     });
+    prisma.rule.findMany.mockResolvedValue([]);
   });
 
   it("deletes the previous learned pattern group when the rule is detached from it", async () => {
@@ -480,7 +620,7 @@ describe("replaceRuleWithResolvedActions", () => {
 
     expect(prisma.rule.findUnique).toHaveBeenCalledWith({
       where: { id: "rule-id", emailAccountId: "email-account-id" },
-      select: { groupId: true },
+      select: expect.objectContaining({ groupId: true }),
     });
     expect(prisma.group.deleteMany).toHaveBeenCalledWith({
       where: { id: "old-group-id", emailAccountId: "email-account-id" },
@@ -517,6 +657,7 @@ describe("rule history snapshots", () => {
       level: "low",
       message: "safe",
     });
+    prisma.rule.findMany.mockResolvedValue([]);
   });
 
   it("writes history when updating instructions", async () => {
